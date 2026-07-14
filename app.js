@@ -1,0 +1,1365 @@
+(function () {
+  const scenarios = window.COACH_TL_SCENARIOS || [];
+  const config = window.COACH_TL_CONFIG || {};
+  const app = document.querySelector("#app");
+  const statusPill = document.querySelector("#status-pill");
+  const draftKey = "coach-tl-scenarios-draft-v1";
+  const privateAccessKey = "coach-tl-private-access-v1";
+  const draft = loadDraft();
+  const queryApplicant = {
+    name: getCleanParam("name"),
+    email: getCleanParam("email"),
+    starhireCandidateId: getCleanParam("starhire_id") || getCleanParam("candidate_id"),
+  };
+  const hasApplicantQuery =
+    Boolean(queryApplicant.name) ||
+    Boolean(queryApplicant.email) ||
+    Boolean(queryApplicant.starhireCandidateId);
+
+  const state = {
+    applicant: hasApplicantQuery ? queryApplicant : draft.applicant || queryApplicant,
+    answers: hasApplicantQuery ? {} : draft.answers || {},
+    index: 0,
+    isSubmitting: false,
+  };
+
+  const isConfigured =
+    Boolean(config.supabaseUrl) &&
+    Boolean(config.supabaseAnonKey) &&
+    !config.supabaseAnonKey.includes("PASTE_");
+
+  const supabaseClient =
+    isConfigured && window.supabase
+      ? window.supabase.createClient(config.supabaseUrl, config.supabaseAnonKey)
+      : null;
+
+  init();
+
+  async function init() {
+    const adminToken = getParam("admin");
+    const reviewToken = getParam("review");
+    const receiptToken = getParam("receipt");
+
+    if (adminToken) {
+      renderPrivateAccessGate("Private dashboard", () => renderAdminDashboard(adminToken));
+      return;
+    }
+
+    if (reviewToken) {
+      renderPrivateAccessGate("Private review", () => renderReview(reviewToken));
+      return;
+    }
+
+    if (receiptToken) {
+      renderReceipt(receiptToken);
+      return;
+    }
+
+    // Arriving from an emailed link (?candidate_id={{candidate_id}}): resolve the
+    // candidate's name + email from StarHire server-side so we can skip the form.
+    const candidateId = getCleanParam("candidate_id");
+    if (candidateId && !(state.applicant.name && isEmail(state.applicant.email))) {
+      const resolved = await resolveStarhireApplicant(candidateId);
+      if (resolved) {
+        state.applicant = {
+          name: resolved.name || state.applicant.name || "",
+          email: isEmail(resolved.email) ? resolved.email : state.applicant.email || "",
+          starhireCandidateId:
+            resolved.id || state.applicant.starhireCandidateId || candidateId,
+        };
+      }
+    }
+
+    if (state.applicant.name && isEmail(state.applicant.email)) {
+      saveDraft();
+      renderScenario(0);
+      return;
+    }
+
+    renderStart();
+  }
+
+  async function resolveStarhireApplicant(candidateId) {
+    const functionName = config.starhireLookupFunctionName;
+    if (!isConfigured || !functionName) return null;
+    setStatus("Loading");
+    app.innerHTML = `
+      <section class="start-layout">
+        <div class="panel start-panel"><p>Loading your details…</p></div>
+      </section>
+    `;
+    try {
+      const response = await fetch(`${config.supabaseUrl}/functions/v1/${functionName}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          apikey: config.supabaseAnonKey,
+          Authorization: `Bearer ${config.supabaseAnonKey}`,
+        },
+        body: JSON.stringify({ candidate_id: candidateId }),
+      });
+      if (!response.ok) return null;
+      const payload = await response.json().catch(() => ({}));
+      const candidate = payload && payload.candidate;
+      if (!candidate || !candidate.name) return null;
+      return {
+        id: String(candidate.id || candidateId),
+        name: String(candidate.name || ""),
+        email: String(candidate.email || ""),
+      };
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function renderStart() {
+    setStatus("Practice task");
+    app.innerHTML = `
+      <section class="start-layout">
+        <form class="panel start-panel" id="start-form">
+          <div class="start-heading">
+            <h2>Review two coaching calls</h2>
+            ${configWarning()}
+          </div>
+          <div class="start-fields">
+            <div class="field">
+              <label for="name">Name</label>
+              <input id="name" name="name" autocomplete="name" required value="${escapeAttr(state.applicant.name)}">
+            </div>
+            <div class="field">
+              <label for="email">Email</label>
+              <input id="email" name="email" type="email" autocomplete="email" required value="${escapeAttr(state.applicant.email)}">
+            </div>
+          </div>
+          <div class="actions start-actions">
+            <button class="primary" type="submit">Start call reviews</button>
+          </div>
+        </form>
+      </section>
+    `;
+
+    document.querySelector("#start-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const form = new FormData(event.currentTarget);
+      state.applicant.name = String(form.get("name") || "").trim();
+      state.applicant.email = String(form.get("email") || "").trim();
+
+      if (!state.applicant.name || !isEmail(state.applicant.email)) {
+        showInlineError(event.currentTarget, "Please enter your name and a valid email.");
+        return;
+      }
+
+      saveDraft();
+      renderScenario(0);
+    });
+  }
+
+  function renderScenario(index) {
+    state.index = index;
+    const scenario = scenarios[index];
+    if (!scenario) {
+      renderSubmit();
+      return;
+    }
+
+    setStatus(`Scenario ${index + 1} of ${scenarios.length}`);
+    app.innerHTML = `
+      <section class="scenario-grid">
+        <aside>
+          <p class="eyebrow">Progress</p>
+          <ol class="progress-list">
+            ${scenarios
+              .map((item, itemIndex) => {
+                const stateClass =
+                  itemIndex === index ? "is-active" : itemIndex < index ? "is-complete" : "";
+                return `
+                  <li class="progress-item ${stateClass}">
+                    <span class="progress-number">${itemIndex + 1}</span>
+                    <span>${escapeHtml(scenarioLabel(itemIndex))}</span>
+                  </li>
+                `;
+              })
+              .join("")}
+          </ol>
+        </aside>
+
+        <article class="panel scenario-panel">
+          <div class="video-wrap">
+            <video controls playsinline preload="metadata" src="${escapeAttr(scenario.video)}"></video>
+          </div>
+          <div class="scenario-body">
+            <h2>${escapeHtml(scenarioLabel(index))}</h2>
+            <p class="prompt">${escapeHtml(scenario.prompt)}</p>
+            <div class="response-fields">
+              ${scenario.fields.map((field) => responseEditorMarkup(scenario, field, index)).join("")}
+            </div>
+            <div class="actions">
+              ${
+                index > 0
+                  ? '<button class="secondary" type="button" id="back-button">Back</button>'
+                  : ""
+              }
+              <button class="primary" type="button" id="next-button">${
+                index === scenarios.length - 1 ? "Review answers" : "Next scenario"
+              }</button>
+            </div>
+          </div>
+        </article>
+      </section>
+    `;
+
+    const editors = Array.from(document.querySelectorAll(".rich-editor[data-field-id]"));
+    const updateAnswers = () => {
+      const scenarioAnswers = getScenarioAnswers(scenario.id);
+      editors.forEach((editor) => {
+        scenarioAnswers[editor.dataset.fieldId] = sanitizeRichHtml(editor.innerHTML);
+      });
+      saveDraft();
+    };
+    editors.forEach((editor) => wireRichEditor(editor, updateAnswers));
+    updateAnswers();
+
+    const back = document.querySelector("#back-button");
+    if (back) {
+      back.addEventListener("click", () => renderScenario(index - 1));
+    }
+
+    document.querySelector("#next-button").addEventListener("click", () => {
+      updateAnswers();
+      const emptyField = scenario.fields.find(
+        (field) => !richTextToPlainText(getAnswerHtml(scenario.id, field.id)).trim()
+      );
+      if (emptyField) {
+        showInlineError(
+          document.querySelector(".scenario-body"),
+          `Please add your response for ${emptyField.label.toLowerCase()} before continuing.`
+        );
+        document.querySelector(`[data-field-id="${emptyField.id}"]`).focus();
+        return;
+      }
+      renderScenario(index + 1);
+    });
+  }
+
+  function renderSubmit() {
+    setStatus("Ready to submit");
+    app.innerHTML = `
+      <section class="receipt-grid">
+        <aside>
+          <p class="eyebrow">Final check</p>
+          <h2>Submit when your answers are ready.</h2>
+          <p class="lede">After submission, this response is final.</p>
+        </aside>
+        <div class="review-surface">
+          <div class="receipt-list">
+            ${scenarios
+              .map(
+                (scenario, index) => `
+                <section class="receipt-item">
+                  <h3>${escapeHtml(scenarioLabel(index))}</h3>
+                  <div class="response-review-list">
+                    ${scenario.fields
+                      .map((field) => answerBoxMarkup(field.label, getAnswerHtml(scenario.id, field.id), field))
+                      .join("")}
+                  </div>
+                  <button class="text-button" type="button" data-edit="${index}">Edit ${escapeHtml(
+                    scenarioLabel(index)
+                  )}</button>
+                </section>
+              `
+              )
+              .join("")}
+          </div>
+          <div class="actions">
+            <button class="secondary" type="button" id="back-to-last">Back</button>
+            <button class="primary" type="button" id="submit-button">Submit responses</button>
+          </div>
+          <div id="submit-message"></div>
+        </div>
+      </section>
+    `;
+
+    document.querySelectorAll("[data-edit]").forEach((button) => {
+      button.addEventListener("click", () => renderScenario(Number(button.dataset.edit)));
+    });
+    document.querySelector("#back-to-last").addEventListener("click", () => renderScenario(scenarios.length - 1));
+    document.querySelector("#submit-button").addEventListener("click", submitResponses);
+  }
+
+  async function submitResponses() {
+    if (state.isSubmitting) return;
+    state.isSubmitting = true;
+    const button = document.querySelector("#submit-button");
+    const message = document.querySelector("#submit-message");
+    button.disabled = true;
+    button.textContent = "Submitting...";
+    message.innerHTML = "";
+
+    try {
+      const responses = {
+        scenarioVersion: "2026-07-coach-tl-v1",
+        answers: scenarios.map((scenario) => ({
+          id: scenario.id,
+          title: scenario.title,
+          prompt: scenario.prompt,
+          fields: scenario.fields.map((field) => {
+            const answerHtml = getAnswerHtml(scenario.id, field.id);
+            return {
+              id: field.id,
+              label: field.label,
+              answer: richTextToPlainText(answerHtml),
+              answerHtml,
+            };
+          }),
+        })),
+      };
+
+      const result = isConfigured
+        ? await submitToSupabase(responses)
+        : await submitInDemoMode(responses);
+
+      localStorage.removeItem(draftKey);
+      renderThanks(result);
+    } catch (error) {
+      message.innerHTML = `<p class="error">${escapeHtml(error.message || "Something went wrong. Please try again.")}</p>`;
+      button.disabled = false;
+      button.textContent = "Submit responses";
+    } finally {
+      state.isSubmitting = false;
+    }
+  }
+
+  async function submitToSupabase(responses) {
+    const { data, error } = await supabaseClient.rpc("submit_coach_tl_scenario", {
+      p_candidate_name: state.applicant.name,
+      p_candidate_email: state.applicant.email,
+      p_responses: responses,
+      p_starhire_candidate_id: state.applicant.starhireCandidateId || null,
+      p_user_agent: navigator.userAgent,
+    });
+
+    if (error) throw error;
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row) throw new Error("Submission was not returned by Supabase.");
+
+    const urls = buildUrls(row.applicant_token, row.review_token);
+    await notifyReviewer(row, urls).catch((error) => {
+      console.warn("Reviewer notification failed", error);
+    });
+
+    return {
+      ...urls,
+      submittedAt: row.created_at,
+    };
+  }
+
+  async function notifyReviewer(row, urls) {
+    const functionName = config.notifyFunctionName;
+    if (!functionName) return;
+
+    const response = await fetch(`${config.supabaseUrl}/functions/v1/${functionName}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: config.supabaseAnonKey,
+        Authorization: `Bearer ${config.supabaseAnonKey}`,
+      },
+      body: JSON.stringify({
+        submission_id: row.submission_id,
+        review_token: row.review_token,
+        review_url: urls.reviewUrl,
+        applicant_url: urls.applicantUrl,
+      }),
+    });
+
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.error || "Reviewer notification could not be sent.");
+    }
+  }
+
+  async function submitInDemoMode(responses) {
+    const applicantToken = crypto.randomUUID();
+    const reviewToken = crypto.randomUUID();
+    const urls = buildUrls(applicantToken, reviewToken);
+    const demoSubmission = {
+      candidate_name: state.applicant.name,
+      candidate_email: state.applicant.email,
+      starhire_candidate_id: state.applicant.starhireCandidateId || null,
+      created_at: new Date().toISOString(),
+      review_status: "open",
+      reviewed_at: null,
+      responses,
+      applicant_token: applicantToken,
+      review_token: reviewToken,
+    };
+    localStorage.setItem(`demo-receipt-${applicantToken}`, JSON.stringify(demoSubmission));
+    localStorage.setItem(`demo-review-${reviewToken}`, JSON.stringify(demoSubmission));
+    saveDemoAdminSubmission(demoSubmission);
+    await wait(350);
+    return {
+      ...urls,
+      submittedAt: demoSubmission.created_at,
+    };
+  }
+
+  function renderThanks(result) {
+    setStatus("Submitted");
+    app.innerHTML = `
+      <section class="intro-grid">
+        <div class="intro-copy">
+          <p class="eyebrow">Submitted</p>
+          <h2>Thank you. Please save this URL.</h2>
+          <p class="lede">We will discuss this further during the hiring process.</p>
+          <p class="success-note">Your response has been saved.</p>
+        </div>
+        <div class="review-surface">
+          <div class="url-box">
+            <label for="receipt-url">Your saved response URL</label>
+            <input id="receipt-url" value="${escapeAttr(result.applicantUrl)}" readonly>
+          </div>
+          <div class="actions">
+            <button class="secondary" type="button" id="copy-url">Copy URL</button>
+            <a class="primary" href="${escapeAttr(result.applicantUrl)}">Open saved response</a>
+          </div>
+        </div>
+      </section>
+    `;
+
+    document.querySelector("#copy-url").addEventListener("click", async () => {
+      await navigator.clipboard.writeText(result.applicantUrl);
+      document.querySelector("#copy-url").textContent = "Copied";
+    });
+  }
+
+  function renderPrivateAccessGate(statusText, onUnlocked) {
+    if (!config.privateAccessPasswordHash || hasPrivateAccess()) {
+      onUnlocked();
+      return;
+    }
+
+    setStatus("Private access");
+    app.innerHTML = `
+      <section class="access-layout">
+        <form class="panel access-panel" id="private-access-form">
+          <div>
+            <p class="eyebrow">${escapeHtml(statusText)}</p>
+            <h2>Enter password</h2>
+            <p class="hint">You only need to enter this once on this browser.</p>
+          </div>
+          <div class="field">
+            <label for="private-password">Password</label>
+            <input id="private-password" name="password" type="password" autocomplete="current-password" required autofocus>
+          </div>
+          <div class="actions">
+            <button class="primary" type="submit">Unlock</button>
+          </div>
+        </form>
+      </section>
+    `;
+
+    const form = document.querySelector("#private-access-form");
+    const password = document.querySelector("#private-password");
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const button = form.querySelector("button");
+      button.disabled = true;
+      button.textContent = "Checking...";
+
+      try {
+        const enteredHash = await sha256(String(password.value || ""));
+        if (enteredHash !== config.privateAccessPasswordHash) {
+          throw new Error("Password not recognised.");
+        }
+        localStorage.setItem(privateAccessKey, enteredHash);
+        onUnlocked();
+      } catch (error) {
+        showInlineError(form, error.message || "Password not recognised.");
+        button.disabled = false;
+        button.textContent = "Unlock";
+        password.select();
+      }
+    });
+  }
+
+  async function renderAdminDashboard(token) {
+    setStatus("Private dashboard");
+    app.innerHTML = `
+      <section class="admin-grid">
+        <div class="intro-copy">
+          <p class="eyebrow">Private dashboard</p>
+          <h2>Coach TL scenario responses</h2>
+          <p class="lede">Bookmark this page. New submissions appear here after refresh.</p>
+        </div>
+        <div class="${isReview ? "review-surface" : "panel form-panel"}">
+          <p class="hint">Loading submissions...</p>
+        </div>
+      </section>
+    `;
+
+    try {
+      const submissions = isConfigured ? await fetchAdminSubmissions(token) : fetchDemoAdminSubmissions();
+      app.innerHTML = adminDashboardMarkup(submissions, token);
+      wireAdminDashboard(token);
+    } catch (error) {
+      renderError("Dashboard unavailable", adminErrorMessage(error), "Dashboard issue");
+    }
+  }
+
+  async function renderReceipt(token) {
+    setStatus("Saved response");
+    try {
+      const submission = isConfigured
+        ? await fetchApplicantSubmission(token)
+        : JSON.parse(localStorage.getItem(`demo-receipt-${token}`) || "null");
+
+      if (!submission) throw new Error("Saved response not found.");
+      app.innerHTML = receiptMarkup(submission, false);
+    } catch (error) {
+      renderError("Saved response not found", error.message);
+    }
+  }
+
+  async function renderReview(token) {
+    setStatus("Private review");
+    try {
+      let submission = isConfigured
+        ? await fetchReviewSubmission(token)
+        : JSON.parse(localStorage.getItem(`demo-review-${token}`) || "null");
+
+      if (!submission) throw new Error("Review response not found.");
+      if (isConfigured && !submission.starhire_candidate_id) {
+        submission = await linkStarHireCandidate(token, submission);
+      }
+      app.innerHTML = receiptMarkup(submission, true, token);
+      wireReviewDecision(token);
+    } catch (error) {
+      renderError("Review response not found", error.message);
+    }
+  }
+
+  async function fetchApplicantSubmission(token) {
+    const { data, error } = await supabaseClient.rpc("get_coach_tl_submission_for_applicant", {
+      p_applicant_token: token,
+    });
+    if (error) throw error;
+    return Array.isArray(data) ? data[0] : data;
+  }
+
+  async function fetchReviewSubmission(token) {
+    const { data, error } = await supabaseClient.rpc("get_coach_tl_submission_for_review", {
+      p_review_token: token,
+    });
+    if (error) throw error;
+    return Array.isArray(data) ? data[0] : data;
+  }
+
+  async function fetchAdminSubmissions(token) {
+    const { data, error } = await supabaseClient.rpc("get_coach_tl_submissions_for_admin", {
+      p_admin_token: token,
+      p_limit: 100,
+    });
+    if (error) throw error;
+    return Array.isArray(data) ? data : [];
+  }
+
+  async function updateReviewStatus(token, reviewStatus) {
+    const normalizedStatus = normalizeReviewStatus(reviewStatus);
+
+    if (isConfigured) {
+      if (normalizedStatus === "rejected") {
+        return rejectInStarHire(token);
+      }
+
+      const { data, error } = await supabaseClient.rpc("set_coach_tl_submission_review_status", {
+        p_review_token: token,
+        p_review_status: normalizedStatus,
+      });
+      if (error) throw error;
+      const row = Array.isArray(data) ? data[0] : data;
+      if (!row) throw new Error("Review response not found.");
+      return row;
+    }
+
+    const submission = JSON.parse(localStorage.getItem(`demo-review-${token}`) || "null");
+    if (!submission) throw new Error("Review response not found.");
+
+    const updatedSubmission = {
+      ...submission,
+      review_status: normalizedStatus,
+      reviewed_at: normalizedStatus === "open" ? null : new Date().toISOString(),
+    };
+
+    localStorage.setItem(`demo-review-${token}`, JSON.stringify(updatedSubmission));
+    if (updatedSubmission.applicant_token) {
+      const receipt = JSON.parse(localStorage.getItem(`demo-receipt-${updatedSubmission.applicant_token}`) || "null");
+      if (receipt) {
+        localStorage.setItem(
+          `demo-receipt-${updatedSubmission.applicant_token}`,
+          JSON.stringify({
+            ...receipt,
+            review_status: updatedSubmission.review_status,
+            reviewed_at: updatedSubmission.reviewed_at,
+          })
+        );
+      }
+    }
+    saveDemoAdminSubmission(updatedSubmission);
+    await wait(250);
+    return updatedSubmission;
+  }
+
+  async function rejectInStarHire(token) {
+    const functionName = config.starhireRejectFunctionName || "reject-coach-tl-scenario";
+    const response = await fetch(`${config.supabaseUrl}/functions/v1/${functionName}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: config.supabaseAnonKey,
+        Authorization: `Bearer ${config.supabaseAnonKey}`,
+      },
+      body: JSON.stringify({ review_token: token }),
+    });
+    const payload = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(payload.error || "StarHire rejection could not be completed.");
+    }
+
+    if (!payload.submission) {
+      throw new Error("StarHire rejection completed, but the updated response was not returned.");
+    }
+
+    return payload.submission;
+  }
+
+  async function linkStarHireCandidate(token, fallbackSubmission) {
+    const functionName = config.starhireLinkFunctionName;
+    if (!functionName) return fallbackSubmission;
+
+    try {
+      const response = await fetch(`${config.supabaseUrl}/functions/v1/${functionName}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          apikey: config.supabaseAnonKey,
+          Authorization: `Bearer ${config.supabaseAnonKey}`,
+        },
+        body: JSON.stringify({ review_token: token }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.submission) return fallbackSubmission;
+      return payload.submission;
+    } catch {
+      return fallbackSubmission;
+    }
+  }
+
+  function adminDashboardMarkup(submissions, token) {
+    const sortedSubmissions = submissions
+      .slice()
+      .sort((left, right) => new Date(right.created_at || 0) - new Date(left.created_at || 0));
+    const latestSubmission = sortedSubmissions[0];
+    const groupedSubmissions = groupSubmissionsByReviewStatus(sortedSubmissions);
+
+    return `
+      <section class="admin-grid">
+        <aside class="admin-sidebar">
+          <p class="eyebrow">Private dashboard</p>
+          <h2>Coach TL scenario responses</h2>
+          <p class="lede">Bookmark this page. New submissions appear here after refresh.</p>
+          <div class="actions">
+            <button class="secondary" type="button" id="refresh-dashboard">Refresh</button>
+          </div>
+        </aside>
+        <div class="dashboard-stack">
+          <div class="dashboard-summary">
+            <div>
+              <span class="summary-number">${groupedSubmissions.open.length}</span>
+              <span class="summary-label">open</span>
+            </div>
+            <div>
+              <span class="summary-number">${groupedSubmissions.accepted.length}</span>
+              <span class="summary-label">accepted</span>
+            </div>
+            <div>
+              <span class="summary-number">${groupedSubmissions.rejected.length}</span>
+              <span class="summary-label">rejected</span>
+            </div>
+            <div>
+              <span class="summary-label">Latest</span>
+              <span class="summary-detail">${
+                latestSubmission ? escapeHtml(formatDate(latestSubmission.created_at)) : "No submissions yet"
+              }</span>
+            </div>
+          </div>
+          ${
+            sortedSubmissions.length
+              ? `<div class="dashboard-sections">
+                  ${dashboardStatusSectionMarkup("open", groupedSubmissions.open)}
+                  ${dashboardStatusSectionMarkup("accepted", groupedSubmissions.accepted)}
+                  ${dashboardStatusSectionMarkup("rejected", groupedSubmissions.rejected)}
+                </div>`
+              : emptyDashboardMarkup()
+          }
+        </div>
+      </section>
+    `;
+  }
+
+  function groupSubmissionsByReviewStatus(submissions) {
+    return submissions.reduce(
+      (groups, submission) => {
+        groups[normalizeReviewStatus(submission.review_status)].push(submission);
+        return groups;
+      },
+      { open: [], accepted: [], rejected: [] }
+    );
+  }
+
+  function dashboardStatusSectionMarkup(status, submissions) {
+    const meta = reviewStatusMeta(status);
+    return `
+      <section class="submission-section submission-section-${status}">
+        <header class="submission-section-header">
+          <div>
+            <h3>${escapeHtml(meta.sectionTitle)}</h3>
+          </div>
+          <span class="section-count">${submissions.length}</span>
+        </header>
+        ${
+          submissions.length
+            ? `<div class="submission-list">${submissions.map(adminSubmissionCardMarkup).join("")}</div>`
+            : `<p class="section-empty">${escapeHtml(meta.emptyText)}</p>`
+        }
+      </section>
+    `;
+  }
+
+  function adminSubmissionCardMarkup(submission) {
+    const urls = buildUrls(submission.applicant_token, submission.review_token);
+    const responses = normalizeResponses(submission.responses);
+    const reviewStatus = normalizeReviewStatus(submission.review_status);
+    const statusMeta = reviewStatusMeta(reviewStatus);
+    const answeredCount = responses.reduce((total, response, index) => {
+      const scenario = scenarios.find((item) => item.id === response.id) || scenarios[index] || {};
+      return (
+        total +
+        normalizeResponseFields(response, scenario).filter((field) =>
+          richTextToPlainText(field.answerHtml || plainTextToHtml(field.answer || "")).trim()
+        ).length
+      );
+    }, 0);
+
+    return `
+      <article class="submission-card">
+        <div class="submission-top">
+          <div>
+            <h3>${escapeHtml(submission.candidate_name || "Applicant")}</h3>
+            <p class="submission-email">${escapeHtml(submission.candidate_email || "")}</p>
+          </div>
+          <div class="submission-card-status">
+            <span class="status-badge status-${reviewStatus}">${escapeHtml(statusMeta.label)}</span>
+            <span class="submission-date">${escapeHtml(formatDate(submission.created_at))}</span>
+          </div>
+        </div>
+        <div class="submission-meta">
+          <span>${answeredCount} of ${totalResponseFields()} responses</span>
+          ${
+            reviewStatus !== "open" && submission.reviewed_at
+              ? `<span>${escapeHtml(statusMeta.label)} ${escapeHtml(formatDate(submission.reviewed_at))}</span>`
+              : ""
+          }
+          ${
+            submission.starhire_candidate_id
+              ? `<a href="${escapeAttr(starhireCandidateUrl(submission.starhire_candidate_id))}" target="_blank" rel="noopener">Open StarHire</a>`
+              : ""
+          }
+        </div>
+        <div class="submission-actions">
+          <a class="primary" href="${escapeAttr(urls.reviewUrl)}" target="_blank" rel="noopener">Open review</a>
+          <a class="secondary" href="${escapeAttr(urls.applicantUrl)}" target="_blank" rel="noopener">Applicant URL</a>
+          <button class="text-button copy-link" type="button" data-copy-url="${escapeAttr(urls.reviewUrl)}">Copy review link</button>
+        </div>
+      </article>
+    `;
+  }
+
+  function emptyDashboardMarkup() {
+    return `
+      <div class="empty-dashboard">
+        <h3>No submissions yet</h3>
+        <p class="hint">When an applicant submits their responses, they will appear here with review and applicant links.</p>
+      </div>
+    `;
+  }
+
+  function wireAdminDashboard(token) {
+    const refreshButton = document.querySelector("#refresh-dashboard");
+    if (refreshButton) {
+      refreshButton.addEventListener("click", () => renderAdminDashboard(token));
+    }
+
+    document.querySelectorAll("[data-copy-url]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        await navigator.clipboard.writeText(button.dataset.copyUrl);
+        button.textContent = "Copied";
+      });
+    });
+  }
+
+  function receiptMarkup(submission, isReview, reviewToken = "") {
+    const responses = normalizeResponses(submission.responses);
+    return `
+      <section class="${isReview ? "review-grid" : "receipt-grid"}">
+        <aside>
+          <p class="eyebrow">${isReview ? "Review" : "Saved response"}</p>
+          <h2>${escapeHtml(submission.candidate_name || "Applicant")}</h2>
+          ${
+            isReview && submission.candidate_email
+              ? `<p class="lede">${escapeHtml(submission.candidate_email)}</p>`
+              : ""
+          }
+          <p class="hint">Submitted ${formatDate(submission.created_at)}</p>
+          ${isReview ? reviewDecisionMarkup(submission, reviewToken) : ""}
+        </aside>
+        <div class="panel form-panel">
+          <div class="${isReview ? "review-list" : "receipt-list"}">
+            ${responses
+              .map((response, index) => {
+                const scenario = scenarios.find((item) => item.id === response.id) || scenarios[index] || {};
+                const fields = normalizeResponseFields(response, scenario);
+                return `
+                  <section class="review-scenario">
+                    <h3>${escapeHtml(scenarioLabel(index))}</h3>
+                    <div class="video-wrap">
+                      <video controls playsinline preload="metadata" src="${escapeAttr(scenario.video || "")}"></video>
+                    </div>
+                    <div class="response-review-list">
+                      ${fields
+                        .map((field) => {
+                          const definition = (scenario.fields || []).find((item) => item.id === field.id) || field;
+                          const label = field.label || definition.label || "Response";
+                          const applicantHtml = field.answerHtml || plainTextToHtml(field.answer || "");
+                          return answerBoxMarkup(label, applicantHtml, definition);
+                        })
+                        .join("")}
+                    </div>
+                  </section>
+                `;
+              })
+              .join("")}
+          </div>
+        </div>
+      </section>
+    `;
+  }
+
+  function reviewDecisionMarkup(submission, reviewToken) {
+    const reviewStatus = normalizeReviewStatus(submission.review_status);
+    const meta = reviewStatusMeta(reviewStatus);
+    const starhireRejectedAt = submission.starhire_rejected_at;
+    const rejectButtonText = reviewStatus === "rejected" && !starhireRejectedAt ? "Reject in StarHire" : "Reject";
+    const reviewedText =
+      reviewStatus !== "open" && submission.reviewed_at
+        ? `${meta.label} ${formatDate(submission.reviewed_at)}`
+        : "No decision yet";
+
+    return `
+      <div class="review-decision" data-review-token="${escapeAttr(reviewToken)}">
+        <div class="review-decision-head">
+          <span class="status-badge status-${reviewStatus}">${escapeHtml(meta.label)}</span>
+          <span class="decision-timestamp">${escapeHtml(reviewedText)}</span>
+        </div>
+        <div class="decision-actions">
+          <button class="primary decision-button" type="button" data-review-status="accepted" ${
+            reviewStatus === "accepted" || starhireRejectedAt ? "disabled" : ""
+          }>Accept</button>
+          <button class="secondary reject-button decision-button" type="button" data-review-status="rejected" ${
+            starhireRejectedAt ? "disabled" : ""
+          }>${escapeHtml(rejectButtonText)}</button>
+        </div>
+        <p class="hint decision-message" aria-live="polite">${escapeHtml(meta.reviewHint)}</p>
+        ${starhireDecisionMarkup(submission)}
+      </div>
+    `;
+  }
+
+  function starhireDecisionMarkup(submission) {
+    const candidateLink = submission.starhire_candidate_id
+      ? starhireCandidateUrl(submission.starhire_candidate_id)
+      : "";
+
+    if (submission.starhire_reject_error) {
+      return `<p class="error starhire-decision">StarHire issue: ${escapeHtml(submission.starhire_reject_error)}</p>`;
+    }
+
+    if (submission.starhire_rejected_at) {
+      return `<p class="hint starhire-decision">StarHire moved to Rejected ${escapeHtml(
+        formatDate(submission.starhire_rejected_at)
+      )}.${candidateLink ? ` <a href="${escapeAttr(candidateLink)}" target="_blank" rel="noopener">Open StarHire candidate</a>` : ""}</p>`;
+    }
+
+    if (candidateLink) {
+      return `<p class="hint starhire-decision"><a href="${escapeAttr(candidateLink)}" target="_blank" rel="noopener">Open StarHire candidate</a>. Reject will move this candidate to StarHire stage Rejected.</p>`;
+    }
+
+    return `<p class="hint starhire-decision">No StarHire candidate ID was captured. Reject will try an exact email match in StarHire before moving anyone.</p>`;
+  }
+
+  function wireReviewDecision(token) {
+    const decisionPanel = document.querySelector(".review-decision");
+    if (!decisionPanel) return;
+
+    const buttons = Array.from(decisionPanel.querySelectorAll("[data-review-status]"));
+    const message = decisionPanel.querySelector(".decision-message");
+
+    buttons.forEach((button) => {
+      button.addEventListener("click", async () => {
+        const nextStatus = normalizeReviewStatus(button.dataset.reviewStatus);
+        if (nextStatus === "rejected") {
+          const confirmed = window.confirm(
+            "Reject this scenario response and move the linked StarHire applicant to Rejected? This changes StarHire."
+          );
+          if (!confirmed) return;
+        }
+
+        const originalButtonStates = buttons.map((item) => ({
+          item,
+          disabled: item.disabled,
+          text: item.textContent,
+        }));
+        buttons.forEach((item) => {
+          item.disabled = true;
+        });
+        button.textContent = "Saving...";
+        message.classList.remove("error");
+        message.textContent =
+          nextStatus === "accepted" ? "Saving as accepted..." : "Rejecting in StarHire...";
+
+        try {
+          const updatedSubmission = await updateReviewStatus(token, nextStatus);
+          app.innerHTML = receiptMarkup(updatedSubmission, true, token);
+          wireReviewDecision(token);
+        } catch (error) {
+          originalButtonStates.forEach(({ item, disabled, text }) => {
+            item.disabled = disabled;
+            item.textContent = text;
+          });
+          message.classList.add("error");
+          message.textContent = reviewStatusErrorMessage(error);
+        }
+      });
+    });
+  }
+
+  function renderError(title, detail, statusText = "Not found") {
+    setStatus(statusText);
+    app.innerHTML = `
+      <section class="intro-grid">
+        <div class="intro-copy">
+          <p class="eyebrow">Unable to load</p>
+          <h2>${escapeHtml(title)}</h2>
+          <p class="lede">${escapeHtml(detail || "Please check the URL and try again.")}</p>
+        </div>
+      </section>
+    `;
+  }
+
+  function normalizeResponses(rawResponses) {
+    const parsed = typeof rawResponses === "string" ? JSON.parse(rawResponses) : rawResponses || {};
+    return parsed.answers || [];
+  }
+
+  function normalizeResponseFields(response, scenario) {
+    if (Array.isArray(response.fields)) return response.fields;
+    if (response.answerHtml || response.answer) {
+      const fallbackField = (scenario.fields || [])[0] || { id: "response", label: "Response" };
+      return [
+        {
+          id: fallbackField.id,
+          label: fallbackField.label,
+          answer: response.answer || "",
+          answerHtml: response.answerHtml || "",
+        },
+      ];
+    }
+    return [];
+  }
+
+  function totalResponseFields() {
+    return scenarios.reduce((total, scenario) => total + (scenario.fields || []).length, 0);
+  }
+
+  function scenarioLabel(index) {
+    return `Scenario ${index + 1}`;
+  }
+
+  function normalizeReviewStatus(value) {
+    const status = String(value || "").trim().toLowerCase();
+    return status === "accepted" || status === "rejected" ? status : "open";
+  }
+
+  function reviewStatusMeta(status) {
+    const normalizedStatus = normalizeReviewStatus(status);
+    const meta = {
+      open: {
+        label: "Open",
+        sectionTitle: "Open submissions",
+        emptyText: "No open submissions.",
+        reviewHint: "Choose Accept or Reject when the decision is ready.",
+      },
+      accepted: {
+        label: "Accepted",
+        sectionTitle: "Accepted submissions",
+        emptyText: "No accepted submissions.",
+        reviewHint: "This submission is marked accepted. The dashboard will show it under Accepted.",
+      },
+      rejected: {
+        label: "Rejected",
+        sectionTitle: "Rejected submissions",
+        emptyText: "No rejected submissions.",
+        reviewHint: "This submission is marked rejected. The dashboard will show it under Rejected.",
+      },
+    };
+    return meta[normalizedStatus];
+  }
+
+  function reviewStatusErrorMessage(error) {
+    const message = String(error && error.message ? error.message : error || "");
+    if (
+      message.includes("set_coach_tl_submission_review_status") ||
+      message.includes("Could not find the function")
+    ) {
+      return "The review decision database update has not been applied in Supabase yet.";
+    }
+    if (message.toLowerCase().includes("starhire rejection") || message.toLowerCase().includes("failed to fetch")) {
+      return "The StarHire rejection backend is not available yet. Check the Supabase function deployment and try again.";
+    }
+    return message || "The decision could not be saved. Please refresh and try again.";
+  }
+
+  function saveDemoAdminSubmission(submission) {
+    const submissions = fetchDemoAdminSubmissions();
+    localStorage.setItem(
+      "demo-admin-submissions",
+      JSON.stringify([
+        submission,
+        ...submissions.filter((item) => item.review_token !== submission.review_token),
+      ])
+    );
+  }
+
+  function fetchDemoAdminSubmissions() {
+    try {
+      return JSON.parse(localStorage.getItem("demo-admin-submissions") || "[]");
+    } catch {
+      return [];
+    }
+  }
+
+  function adminErrorMessage(error) {
+    const message = String(error && error.message ? error.message : error || "");
+    if (message.includes("get_coach_tl_submissions_for_admin") || message.includes("Could not find the function")) {
+      return "The private dashboard database function has not been applied in Supabase yet.";
+    }
+    if (message.toLowerCase().includes("invalid admin token")) {
+      return "This dashboard link is not recognised.";
+    }
+    return message || "Please refresh the page and try again.";
+  }
+
+  function hasPrivateAccess() {
+    return localStorage.getItem(privateAccessKey) === config.privateAccessPasswordHash;
+  }
+
+  async function sha256(value) {
+    if (!window.crypto || !window.crypto.subtle) {
+      throw new Error("This browser cannot check the password. Please use a current browser.");
+    }
+    const bytes = new TextEncoder().encode(value);
+    const digest = await window.crypto.subtle.digest("SHA-256", bytes);
+    return Array.from(new Uint8Array(digest))
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+  }
+
+  function getScenarioAnswers(scenarioId) {
+    const current = state.answers[scenarioId];
+    if (!current || typeof current !== "object" || Array.isArray(current)) {
+      state.answers[scenarioId] = {};
+    }
+    return state.answers[scenarioId];
+  }
+
+  function getAnswerHtml(scenarioId, fieldId) {
+    const scenarioAnswers = state.answers[scenarioId];
+    const value =
+      scenarioAnswers && typeof scenarioAnswers === "object" && !Array.isArray(scenarioAnswers)
+        ? scenarioAnswers[fieldId]
+        : "";
+
+    if (!value) return "";
+    if (typeof value === "object") {
+      return sanitizeRichHtml(value.html || plainTextToHtml(value.text || value.answer || ""));
+    }
+    if (looksLikeRichHtml(value)) return sanitizeRichHtml(value);
+    return plainTextToHtml(value);
+  }
+
+  function wireRichEditor(editor, onChange) {
+    const toolbar = editor.closest(".rich-editor-shell").querySelector(".rich-toolbar");
+
+    editor.addEventListener("input", () => {
+      onChange();
+      updateToolbarState(toolbar);
+    });
+    editor.addEventListener("keyup", () => updateToolbarState(toolbar));
+    editor.addEventListener("mouseup", () => updateToolbarState(toolbar));
+    editor.addEventListener("paste", (event) => {
+      event.preventDefault();
+      const pastedHtml = event.clipboardData.getData("text/html");
+      const pastedText = event.clipboardData.getData("text/plain");
+      const safeHtml = sanitizeRichHtml(pastedHtml || plainTextToHtml(pastedText));
+      document.execCommand("insertHTML", false, safeHtml);
+      onChange();
+      updateToolbarState(toolbar);
+    });
+
+    toolbar.querySelectorAll("[data-command]").forEach((button) => {
+      button.addEventListener("mousedown", (event) => event.preventDefault());
+      button.addEventListener("click", () => {
+        editor.focus();
+        document.execCommand(button.dataset.command, false, null);
+        onChange();
+        updateToolbarState(toolbar);
+      });
+    });
+  }
+
+  function updateToolbarState(toolbar) {
+    toolbar.querySelectorAll("[data-command]").forEach((button) => {
+      try {
+        button.classList.toggle("is-active", document.queryCommandState(button.dataset.command));
+      } catch {
+        button.classList.remove("is-active");
+      }
+    });
+  }
+
+  function responseEditorMarkup(scenario, field, scenarioIndex) {
+    const editorId = `answer-${scenarioIndex}-${field.id}`;
+    return `
+      <section class="response-field">
+        <div class="response-field-heading">
+          <label class="field-label" id="${escapeAttr(editorId)}-label" for="${escapeAttr(editorId)}">${escapeHtml(
+            field.label
+          )}</label>
+          ${fieldGuidanceMarkup(field)}
+        </div>
+        <div class="rich-editor-shell">
+          <div class="rich-toolbar" role="toolbar" aria-label="Formatting tools for ${escapeAttr(field.label)}">
+            <button class="tool-button" type="button" data-command="bold" aria-label="Bold" title="Bold"><strong>B</strong></button>
+            <button class="tool-button" type="button" data-command="italic" aria-label="Italic" title="Italic"><em>I</em></button>
+            <button class="tool-button" type="button" data-command="insertUnorderedList" aria-label="Bullet list" title="Bullet list"><span aria-hidden="true">&bull;</span></button>
+            <button class="tool-button" type="button" data-command="insertOrderedList" aria-label="Numbered list" title="Numbered list"><span aria-hidden="true">1.</span></button>
+          </div>
+          <div
+            class="rich-editor"
+            id="${escapeAttr(editorId)}"
+            contenteditable="true"
+            role="textbox"
+            aria-labelledby="${escapeAttr(editorId)}-label"
+            aria-multiline="true"
+            spellcheck="true"
+            data-field-id="${escapeAttr(field.id)}"
+            data-placeholder="Write your notes here..."
+          >${getAnswerHtml(scenario.id, field.id)}</div>
+        </div>
+      </section>
+    `;
+  }
+
+  function fieldGuidanceMarkup(field) {
+    if (!field.hint && !field.criteria) return "";
+    return `
+      <div class="response-guidance">
+        ${field.hint ? `<p>${escapeHtml(field.hint)}</p>` : ""}
+        ${
+          Array.isArray(field.criteria) && field.criteria.length
+            ? `<ul>${field.criteria.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`
+            : ""
+        }
+      </div>
+    `;
+  }
+
+  function answerBoxMarkup(label, html, field = {}) {
+    return `
+      <div class="answer-box">
+        <strong class="answer-label">${escapeHtml(label)}</strong>
+        ${fieldGuidanceMarkup(field)}
+        <div class="formatted-answer">${sanitizeRichHtml(html)}</div>
+      </div>
+    `;
+  }
+
+  function plainTextToHtml(text) {
+    const value = String(text || "").replace(/\r\n/g, "\n").trim();
+    if (!value) return "";
+    return value
+      .split("\n")
+      .map((line) => (line ? `<p>${escapeHtml(line)}</p>` : "<p><br></p>"))
+      .join("");
+  }
+
+  function richTextToPlainText(html) {
+    const container = document.createElement("div");
+    container.innerHTML = sanitizeRichHtml(html);
+    container.querySelectorAll("br").forEach((node) => node.replaceWith("\n"));
+    container.querySelectorAll("p, li").forEach((node) => node.append(document.createTextNode("\n")));
+    return container.textContent.replace(/\n{3,}/g, "\n\n").trim();
+  }
+
+  function sanitizeRichHtml(html) {
+    const template = document.createElement("template");
+    const output = document.createElement("div");
+    template.innerHTML = String(html || "");
+
+    template.content.childNodes.forEach((node) => appendCleanNode(output, node));
+    output.querySelectorAll("p").forEach((node) => {
+      if (!node.textContent.trim() && !node.querySelector("br")) node.remove();
+    });
+    return output.innerHTML.trim();
+  }
+
+  function appendCleanNode(parent, node) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      parent.append(document.createTextNode(node.textContent));
+      return;
+    }
+
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+    const tag = node.tagName.toLowerCase();
+    if (tag === "script" || tag === "style") return;
+
+    const tagMap = {
+      b: "strong",
+      strong: "strong",
+      i: "em",
+      em: "em",
+      div: "p",
+      p: "p",
+      ul: "ul",
+      ol: "ol",
+      li: "li",
+      br: "br",
+    };
+    const cleanTag = tagMap[tag];
+
+    if (!cleanTag) {
+      node.childNodes.forEach((child) => appendCleanNode(parent, child));
+      return;
+    }
+
+    const element = document.createElement(cleanTag);
+    node.childNodes.forEach((child) => appendCleanNode(element, child));
+    parent.append(element);
+  }
+
+  function looksLikeRichHtml(value) {
+    return /<\/?(strong|em|b|i|ul|ol|li|p|div|br)\b/i.test(String(value || ""));
+  }
+
+  function buildUrls(applicantToken, reviewToken) {
+    const base = `${window.location.origin}${window.location.pathname}`;
+    return {
+      applicantUrl: `${base}?receipt=${encodeURIComponent(applicantToken)}`,
+      reviewUrl: `${base}?review=${encodeURIComponent(reviewToken)}`,
+    };
+  }
+
+  function starhireCandidateUrl(candidateId) {
+    const positionId = config.starhirePositionId || "237";
+    return `https://app.starhire.io/emersoncoaching/positions/${encodeURIComponent(positionId)}/candidates/${encodeURIComponent(candidateId)}`;
+  }
+
+  function configWarning() {
+    if (isConfigured) return "";
+    return `
+      <div class="config-warning">
+        Supabase is in demo mode until the anon public key is added to config.js.
+      </div>
+    `;
+  }
+
+  function showInlineError(container, text) {
+    const existing = container.querySelector(".error");
+    if (existing) existing.remove();
+    const node = document.createElement("p");
+    node.className = "error";
+    node.textContent = text;
+    container.appendChild(node);
+  }
+
+  function loadDraft() {
+    try {
+      return JSON.parse(localStorage.getItem(draftKey) || "{}");
+    } catch {
+      return {};
+    }
+  }
+
+  function saveDraft() {
+    localStorage.setItem(
+      draftKey,
+      JSON.stringify({
+        applicant: state.applicant,
+        answers: state.answers,
+      })
+    );
+  }
+
+  function getParam(name) {
+    return new URLSearchParams(window.location.search).get(name);
+  }
+
+  function getCleanParam(name) {
+    const value = String(getParam(name) || "").trim();
+    return /\{\{[^}]+\}\}/.test(value) ? "" : value;
+  }
+
+  function setStatus(text) {
+    statusPill.textContent = text;
+  }
+
+  function isEmail(value) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+  }
+
+  function formatDate(value) {
+    if (!value) return "";
+    return new Intl.DateTimeFormat("en-AU", {
+      dateStyle: "medium",
+      timeStyle: "short",
+    }).format(new Date(value));
+  }
+
+  function wait(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function escapeHtml(value) {
+    return String(value || "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  function escapeAttr(value) {
+    return escapeHtml(value).replaceAll("`", "&#096;");
+  }
+})();
