@@ -10,7 +10,7 @@ Target live site: https://emersoncoaching.github.io/coach-tl-practice-scenarios/
 - Run `supabase/schema.sql` in the Supabase SQL editor to create the Coach TL submission table and RPC functions.
 - The two call-review videos are included in `assets/videos/`.
 - Applicants complete six rich-text response fields for each call.
-- Private review pages compare each applicant response with internal reference notes; applicant pages never display the reference notes.
+- Private review pages show the applicant's responses only; this version does not include reference answers.
 - Dan reviews submissions from the private dashboard URL stored in `private/admin-dashboard.md`.
 - Review pages can mark submissions accepted or rejected, and the dashboard groups open, accepted, and rejected submissions.
 - Dan-facing dashboard and review pages require a one-time private-access password in each browser.
