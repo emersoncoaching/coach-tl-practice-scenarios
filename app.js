@@ -447,6 +447,7 @@
             <h2>Enter password</h2>
             <p class="hint">You only need to enter this once on this browser.</p>
           </div>
+          <input type="text" name="username" value="Emerson Coaching reviewer" autocomplete="username" hidden>
           <div class="field">
             <label for="private-password">Password</label>
             <input id="private-password" name="password" type="password" autocomplete="current-password" required autofocus>
@@ -491,7 +492,7 @@
           <h2>Coach TL scenario responses</h2>
           <p class="lede">Bookmark this page. New submissions appear here after refresh.</p>
         </div>
-        <div class="${isReview ? "review-surface" : "panel form-panel"}">
+        <div class="panel form-panel">
           <p class="hint">Loading submissions...</p>
         </div>
       </section>
